@@ -1,0 +1,179 @@
+#!/bin/bash
+
+set -e
+
+executable_file=""
+output_dir="./output"
+packer_dir_name="sopacker-tmpdir"
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "-h"|"--help")
+            echo "Usage: "$0" [executable_file] [--output=output_dir]"
+            echo "  executable_file: the path to the executable file"
+            echo "  --output: (optional) the path to the output directory (default: ./output)"
+            exit 0
+        ;;
+        *)
+            if [ -z "$executable_file" ]; then
+                executable_file="$1"
+                elif [[ "$1" == --output=* ]]; then
+                output_dir="${1#*=}"
+            else
+                echo "Error: Invalid argument '$1'"
+                echo "Run './packer.sh --help' for usage information"
+                exit 1
+            fi
+            shift
+        ;;
+    esac
+done
+
+# Check if executable file is provided
+if [ -z "$executable_file" ]; then
+    echo "Error: No executable file provided"
+    echo "Run './packer.sh --help' for usage information"
+    exit 1
+fi
+
+# Check if executable file exists
+if [ ! -f "$executable_file" ]; then
+    echo "Error: Executable file '$executable_file' not found"
+    exit 1
+fi
+
+# Get the base name of the executable
+base_name=$(basename $executable_file)
+
+# Pack the dependencies into a tarball
+echo "Packing dependencies for '$executable_file' into '$output_dir'"
+# Get the absolute path of the script
+script=$(readlink -f "$0")
+
+# Create output directory
+if [ ! -d "$output_dir" ]; then
+    echo "Creating output directory '$output_dir'"
+    mkdir -p "$output_dir"
+fi
+
+# Get required libraries for the executable
+libs=$(ldd $executable_file | grep -oP '=> \K[^ ]+')
+lib_interp=$(ldd $executable_file | grep ld-linux | awk '{print $1}')
+tempdir=$(mktemp -d /tmp/$packer_dir_name.XXXXXX)
+
+if [ ! -x "patchelf" ]; then
+    if [ ! -d "patchelf_src/.git" ]; then
+        git submodule update --init --recursive
+    fi
+    pushd patchelf_src > /dev/null
+    ./bootstrap.sh
+    ./configure
+    make
+    cp src/patchelf ../
+    popd > /dev/null
+fi
+
+# Copy the executable and required files to the temporary directory
+cp -f $executable_file $tempdir
+cp -f $lib_interp $tempdir
+cp -f ./patchelf $tempdir
+
+for lib in $libs
+do
+    cp -f $lib $tempdir
+done
+
+# Change to the temporary directory
+pushd $tempdir >/dev/null
+
+# Update the rpath and interpreter for the executable
+for file in *; do
+    if ! echo "$file" | grep -Eq 'ld-linux|patchelf'; then
+        echo "patching $file"
+        if ! ldd $file | grep -q "statically linked"; then
+            if readelf -l $file | grep -q INTERP; then
+                ./patchelf --set-interpreter $tempdir/ld-linux-x86-64.so.2 $file
+            fi
+            ./patchelf --set-rpath $tempdir $file
+        fi
+    fi
+done
+
+# Calculate MD5 checksum of the executable
+md5=$(md5sum ./$base_name | awk '{print $1}')
+
+# Create a tar archive of the files in the temporary directory, excluding 'patchelf'
+tar -cf ./$base_name.tar --exclude='patchelf' *
+
+# Remove the executable from the temporary directory
+rm ./$base_name
+
+# Get the offset of the tar file in the script
+offset=$(awk '/^__UNPACK_FOLLOWS__/ { print NR + 1; exit 0; }' "$script")
+
+# Extract the tar file from the script and save it to a new file
+tail -n+$offset "$script" > $base_name
+
+# Append the tar file to the new file
+cat  ./$base_name.tar >> $base_name
+
+# Insert MD5 checksum, executable name, and temporary directory path into the new file
+sed -i "2a\md5sum=$md5" $base_name
+sed -i "2a\execname=$base_name" $base_name
+sed -i "2a\tempdir=$tempdir" $base_name
+
+# Change back to the original directory
+popd >/dev/null
+
+# Copy the new file to the output directory and make it executable
+cp -f $tempdir/$base_name $output_dir
+chmod +x $output_dir/$base_name
+
+# Remove the temporary directory
+rm -rf $tempdir
+
+echo "Done!"
+
+exit 0
+
+__UNPACK_FOLLOWS__
+#!/bin/bash
+
+# Insert md5sum, execname and tempdir here
+
+
+# Function to find a matching directory based on MD5 checksum and filename
+find_matching_dir() {
+    local expected_md5="$1"
+    local filename="$2"
+    local dir="$3"
+
+    if [ -f "$dir/$filename" ]; then
+        local actual_md5=$(md5sum "$dir/$filename" | cut -d' ' -f1)
+        if [ "$actual_md5" = "$expected_md5" ]; then
+            return 0
+        else
+            rm -rf $dir
+            return 1
+        fi
+    fi
+
+    return 1
+}
+
+find_matching_dir $md5sum $execname $tempdir
+
+# If a matching directory is not found, extract the tar file and create a new directory
+if [ $? -ne 0 ]; then
+    mkdir -p $tempdir
+    offset=$(awk '/^__TARFILE_FOLLOWS__/ { print NR + 1; exit 0; }' "$0")
+    tail -n+$offset "$0" | tar -xf - -C $tempdir >/dev/null 2>&1
+fi
+
+# Execute the program with the provided arguments
+$tempdir/$execname $@
+
+exit 0
+
+__TARFILE_FOLLOWS__
