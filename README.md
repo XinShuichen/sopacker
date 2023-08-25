@@ -1,14 +1,24 @@
 # sopacker
 
+> 注意: 这个方式本身逻辑没有问题, 如果打包后无法运行, 应该是patchelf的bug. 类似llvm-dwarfdump这些程序都会出现这个情况. 后续会尝试用libelf自己写一个或者给patchelf提fix.
+>
+> 请大家有遇到这种情况时帮忙提issue到本工程.
+>
+> Note that there is no logical problem with this method. If the packaged binary fails to run, it is likely a bug in patchelf. Similar issues have been observed with programs such as `llvm-dwarfdump`. In the future, we will attempt to write a custom library using `libelf` or provide a fix for patchelf.
+>
+> If you encounter such issues, please help us by creating an issue in this project.
+
 sopacker是一个用于打包可执行文件和动态库的脚本工程. 生成的新可执行文件可以在大部分Linux上运行.
 
 sopacker is a script for packaging an executable file and all its dependent dynamic link libraries. The resulting executable can theoretically run on any Linux environment.
 
 ## Usage
 
-这个项目本身除了patchelf, binutils外没有依赖. 但是需要满足patchelf的依赖. https://github.com/NixOS/patchelf/tree/c40128936fc804b74abddaa0bc1d8ef6e5dba48e
+这个项目本身除了patchelf, binutils外没有依赖. 但是需要满足patchelf的依赖. 安装autoconf/automake即可. https://github.com/NixOS/patchelf/tree/c40128936fc804b74abddaa0bc1d8ef6e5dba48e
 
-This project has no dependencies other than patchelf and binutils. However, the dependencies of patchelf need to be satisfied. https://github.com/NixOS/patchelf/tree/c40128936fc804b74abddaa0bc1d8ef6e5dba48e
+This project has no dependencies other than patchelf and binutils. However, the dependencies of patchelf need to be satisfied. Install autoconf/automake. https://github.com/NixOS/patchelf/tree/c40128936fc804b74abddaa0bc1d8ef6e5dba48e
+
+`apt install autoconf automake`
 
 除此以外需要binutils. 例如debian/ubuntu: `apt install binutils`
 
