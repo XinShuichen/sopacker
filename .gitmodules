@@ -1,3 +1,3 @@
-[submodule "patchself_src"]
-	path = patchself_src
+[submodule "patchelf_src"]
+	path = patchelf_src
 	url = https://github.com/NixOS/patchelf.git
