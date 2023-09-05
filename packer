@@ -237,7 +237,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Execute the program with the provided arguments
-$tempdir/$execname $@
+$tempdir/$execname "$@"
 
 exit 0
 
