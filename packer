@@ -125,10 +125,10 @@ for file in *; do
     if ! echo "$file" | grep -Eq 'ld-linux|patchelf'; then
         echo "patching $file"
         if ! ldd $file | grep -q "statically linked"; then
+            ./patchelf --set-rpath $tempdir $file        
             if readelf -l $file | grep -q INTERP; then
                 ./patchelf --set-interpreter $tempdir/ld-linux-x86-64.so.2 $file
             fi
-            ./patchelf --set-rpath $tempdir $file
         fi
     fi
 done
