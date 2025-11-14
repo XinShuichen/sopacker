@@ -93,6 +93,7 @@ fi
 # Get required libraries for the executable
 libs=$(ldd $executable_file | grep -oP '=> \K[^ ]+')
 lib_interp=$(ldd $executable_file | grep ld-linux | awk '{print $1}')
+lib_interp_name=$(basename $lib_interp)
 tempdir=$(mktemp -d /tmp/$packer_dir_name.XXXXXX)
 
 if [ ! -x "patchelf" ]; then
@@ -127,7 +128,7 @@ for file in *; do
         if ! ldd $file | grep -q "statically linked"; then
             ./patchelf --set-rpath $tempdir $file        
             if readelf -l $file | grep -q INTERP; then
-                ./patchelf --set-interpreter $tempdir/ld-linux-x86-64.so.2 $file
+                ./patchelf --set-interpreter $tempdir/$lib_interp_name $file
             fi
         fi
     fi
