@@ -91,10 +91,14 @@ if [ ! -d "$output_dir" ]; then
 fi
 
 # Get required libraries for the executable
-libs=$(ldd $executable_file | grep -oP '=> \K[^ ]+')
-lib_interp=$(ldd $executable_file | grep ld-linux | awk '{print $1}')
-lib_interp_name=$(basename $lib_interp)
-tempdir=$(mktemp -d /tmp/$packer_dir_name.XXXXXX)
+libs=$(ldd "$executable_file" | grep -oP '=> \K[^ ]+')
+lib_interp=$(readelf -l "$executable_file" 2>/dev/null | awk -F': ' '/Requesting program interpreter/ { gsub(/[\[\]]/,"",$2); print $2; exit }')
+if [ -z "$lib_interp" ]; then
+    echo "Error: Failed to detect ELF interpreter (PT_INTERP) for '$executable_file'" >&2
+    exit 1
+fi
+lib_interp_name=$(basename "$lib_interp")
+tempdir=$(mktemp -d "/tmp/$packer_dir_name.XXXXXX")
 
 if [ ! -x "patchelf" ]; then
     if [ ! -d "patchelf_src/.git" ]; then
@@ -109,63 +113,65 @@ if [ ! -x "patchelf" ]; then
 fi
 
 # Copy the executable and required files to the temporary directory
-cp -f $executable_file $tempdir
-cp -f $lib_interp $tempdir
-cp -f ./patchelf $tempdir
+cp -f "$executable_file" "$tempdir"
+cp -f "$lib_interp" "$tempdir"
+cp -f ./patchelf "$tempdir"
 
-for lib in $libs
-do
-    cp -f $lib $tempdir
+for lib in $libs; do
+    if [ -f "$lib" ]; then
+        cp -f "$lib" "$tempdir"
+    fi
 done
 
 # Change to the temporary directory
-pushd $tempdir >/dev/null
+pushd "$tempdir" >/dev/null
 
 # Update the rpath and interpreter for the executable
 for file in *; do
     if ! echo "$file" | grep -Eq 'ld-linux|patchelf'; then
         echo "patching $file"
         if ! ldd $file | grep -q "statically linked"; then
-            ./patchelf --set-rpath $tempdir $file        
+            ./patchelf --set-rpath "$tempdir" "$file"
             if readelf -l $file | grep -q INTERP; then
-                ./patchelf --set-interpreter $tempdir/$lib_interp_name $file
+                ./patchelf --set-interpreter "$tempdir/$lib_interp_name" "$file"
             fi
         fi
     fi
 done
 
 # Calculate MD5 checksum of the executable
-md5=$(md5sum ./$base_name | awk '{print $1}')
+md5=$(md5sum "./$base_name" | awk '{print $1}')
 
 # Create a tar archive of the files in the temporary directory, excluding 'patchelf'
-tar -cf ./$base_name.tar --exclude='patchelf' *
+tar -cf "./$base_name.tar" --exclude='patchelf' *
 
 # Remove the executable from the temporary directory
-rm ./$base_name
+rm "./$base_name"
 
 # Get the offset of the tar file in the script
 offset=$(awk '/^__UNPACK_FOLLOWS__/ { print NR + 1; exit 0; }' "$script")
 
 # Extract the tar file from the script and save it to a new file
-tail -n+$offset "$script" > $base_name
+tail -n+$offset "$script" > "$base_name"
 
 # Append the tar file to the new file
-cat  ./$base_name.tar >> $base_name
+cat  "./$base_name.tar" >> "$base_name"
 
 # Insert MD5 checksum, executable name, and temporary directory path into the new file
-sed -i "2a\md5sum=$md5" $base_name
-sed -i "2a\execname=$base_name" $base_name
-sed -i "2a\tempdir=$tempdir" $base_name
+sed -i "2a\md5sum=$md5" "$base_name"
+sed -i "2a\execname=$base_name" "$base_name"
+sed -i "2a\interpname=$lib_interp_name" "$base_name"
+sed -i "2a\tempdir=$tempdir" "$base_name"
 
 # Change back to the original directory
 popd >/dev/null
 
 # Copy the new file to the output directory and make it executable
-cp -f $tempdir/$base_name $output_dir
-chmod +x $output_dir/$base_name
+cp -f "$tempdir/$base_name" "$output_dir"
+chmod +x "$output_dir/$base_name"
 
 # Remove the temporary directory
-rm -rf $tempdir
+rm -rf "$tempdir"
 
 echo "Done!"
 
@@ -174,7 +180,7 @@ exit 0
 __UNPACK_FOLLOWS__
 #!/bin/bash
 
-# Insert md5sum, execname and tempdir here
+# Insert md5sum, execname, interpname and tempdir here
 
 # BSD 3-Clause License
 
@@ -237,8 +243,10 @@ if [ $? -ne 0 ]; then
     tail -n+$offset "$0" | tar -xf - -C $tempdir >/dev/null 2>&1
 fi
 
-# Execute the program with the provided arguments
-$tempdir/$execname "$@"
+# Execute the program with the provided arguments.
+# NOTE: `ldd` on the extracted executable is misleading because the system `ldd` script
+# uses the host loader to trace dependencies. We explicitly invoke the bundled loader.
+"$tempdir/$interpname" --library-path "$tempdir" "$tempdir/$execname" "$@"
 
 exit 0
 
