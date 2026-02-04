@@ -35,7 +35,7 @@
 
 set -e
 
-executable_file=""
+executable_files=()
 output_dir="./output"
 packer_dir_name="sopacker-tmpdir"
 
@@ -43,44 +43,49 @@ packer_dir_name="sopacker-tmpdir"
 while [ $# -gt 0 ]; do
     case "$1" in
         "-h"|"--help")
-            echo "Usage: "$0" [executable_file] [--output=output_dir]"
-            echo "  executable_file: the path to the executable file"
+            echo "Usage: "$0" [executable_file ...] [--output=output_dir]"
+            echo "  executable_file: one or more paths to executable files"
             echo "  --output: (optional) the path to the output directory (default: ./output)"
             exit 0
         ;;
+        --output=*)
+            output_dir="${1#*=}"
+            shift
+        ;;
         *)
-            if [ -z "$executable_file" ]; then
-                executable_file="$1"
-                elif [[ "$1" == --output=* ]]; then
-                output_dir="${1#*=}"
-            else
-                echo "Error: Invalid argument '$1'"
-                echo "Run './packer.sh --help' for usage information"
-                exit 1
-            fi
+            executable_files+=("$1")
             shift
         ;;
     esac
 done
 
 # Check if executable file is provided
-if [ -z "$executable_file" ]; then
-    echo "Error: No executable file provided"
+if [ ${#executable_files[@]} -eq 0 ]; then
+    echo "Error: No executable file provided" >&2
     echo "Run './packer.sh --help' for usage information"
     exit 1
 fi
 
-# Check if executable file exists
-if [ ! -f "$executable_file" ]; then
-    echo "Error: Executable file '$executable_file' not found"
-    exit 1
-fi
+# Validate executables and ensure unique output names
+declare -A output_name_seen
+base_names=()
+for executable_file in "${executable_files[@]}"; do
+    if [ ! -f "$executable_file" ]; then
+        echo "Error: Executable file '$executable_file' not found" >&2
+        exit 1
+    fi
 
-# Get the base name of the executable
-base_name=$(basename $executable_file)
+    base_name=$(basename "$executable_file")
+    if [ -n "${output_name_seen[$base_name]}" ]; then
+        echo "Error: Duplicate executable basename '$base_name'. Please rename inputs." >&2
+        exit 1
+    fi
+    output_name_seen[$base_name]=1
+    base_names+=("$base_name")
+done
 
 # Pack the dependencies into a tarball
-echo "Packing dependencies for '$executable_file' into '$output_dir'"
+echo "Packing dependencies into '$output_dir'"
 # Get the absolute path of the script
 script=$(readlink -f "$0")
 
@@ -90,15 +95,60 @@ if [ ! -d "$output_dir" ]; then
     mkdir -p "$output_dir"
 fi
 
-# Get required libraries for the executable
-libs=$(ldd "$executable_file" | grep -oP '=> \K[^ ]+')
-lib_interp=$(readelf -l "$executable_file" 2>/dev/null | awk -F': ' '/Requesting program interpreter/ { gsub(/[\[\]]/,"",$2); print $2; exit }')
-if [ -z "$lib_interp" ]; then
-    echo "Error: Failed to detect ELF interpreter (PT_INTERP) for '$executable_file'" >&2
+# Collect required libraries for all executables (deduplicated)
+declare -A src_seen
+src_files=()
+
+lib_interp=""
+lib_interp_name=""
+
+for executable_file in "${executable_files[@]}"; do
+    cur_interp=$(readelf -l "$executable_file" 2>/dev/null | awk -F': ' '/Requesting program interpreter/ { gsub(/[\[\]]/,"",$2); print $2; exit }')
+    if [ -z "$cur_interp" ]; then
+        echo "Error: Failed to detect ELF interpreter (PT_INTERP) for '$executable_file'" >&2
+        exit 1
+    fi
+
+    cur_interp_name=$(basename "$cur_interp")
+    if [ -z "$lib_interp" ]; then
+        lib_interp="$cur_interp"
+        lib_interp_name="$cur_interp_name"
+    else
+        if [ "$cur_interp_name" != "$lib_interp_name" ]; then
+            echo "Error: Multiple ELF interpreters detected: '$lib_interp_name' and '$cur_interp_name'." >&2
+            exit 1
+        fi
+    fi
+
+    if [ -z "${src_seen[$executable_file]}" ]; then
+        src_seen[$executable_file]=1
+        src_files+=("$executable_file")
+    fi
+
+    libs=$(ldd "$executable_file" 2>/dev/null | grep -oP '=> \K[^ ]+')
+    for lib in $libs; do
+        if [ -f "$lib" ] && [ -z "${src_seen[$lib]}" ]; then
+            src_seen[$lib]=1
+            src_files+=("$lib")
+        fi
+    done
+done
+
+if [ ! -f "$lib_interp" ]; then
+    echo "Error: ELF interpreter '$lib_interp' not found on this system" >&2
     exit 1
 fi
-lib_interp_name=$(basename "$lib_interp")
-tempdir=$(mktemp -d "/tmp/$packer_dir_name.XXXXXX")
+if [ -z "${src_seen[$lib_interp]}" ]; then
+    src_seen[$lib_interp]=1
+    src_files+=("$lib_interp")
+fi
+
+# Compute a stable bundle id from the content of all inputs
+bundle_id=$( (for f in "${src_files[@]}"; do sha256sum "$f"; done) | sort -k2 | sha256sum | awk '{print $1}')
+runtime_tempdir="/tmp/sopacker-$bundle_id"
+
+# Build directory (packaging-time)
+tempdir=$(mktemp -d "/tmp/$packer_dir_name.build.XXXXXX")
 
 if [ ! -x "patchelf" ]; then
     if [ ! -d "patchelf_src/.git" ]; then
@@ -112,63 +162,68 @@ if [ ! -x "patchelf" ]; then
     popd > /dev/null
 fi
 
-# Copy the executable and required files to the temporary directory
-cp -f "$executable_file" "$tempdir"
+# Copy executables, libs and required tools to the build directory
+for executable_file in "${executable_files[@]}"; do
+    cp -f "$executable_file" "$tempdir"
+done
 cp -f "$lib_interp" "$tempdir"
-cp -f ./patchelf "$tempdir"
+cp -f ./patchelf "$tempdir/__sopacker_patchelf"
 
-for lib in $libs; do
-    if [ -f "$lib" ]; then
-        cp -f "$lib" "$tempdir"
+for f in "${src_files[@]}"; do
+    if [ "$f" != "$lib_interp" ]; then
+        cp -f "$f" "$tempdir"
     fi
 done
 
 # Change to the temporary directory
 pushd "$tempdir" >/dev/null
 
-# Update the rpath and interpreter for the executable
+# Update the rpath and interpreter for all binaries
 for file in *; do
-    if ! echo "$file" | grep -Eq 'ld-linux|patchelf'; then
+    if ! echo "$file" | grep -Eq 'ld-linux|__sopacker_patchelf'; then
         echo "patching $file"
         if ! ldd $file | grep -q "statically linked"; then
-            ./patchelf --set-rpath "$tempdir" "$file"
+            ./\__sopacker_patchelf --set-rpath "$runtime_tempdir" "$file"
             if readelf -l $file | grep -q INTERP; then
-                ./patchelf --set-interpreter "$tempdir/$lib_interp_name" "$file"
+                ./\__sopacker_patchelf --set-interpreter "$runtime_tempdir/$lib_interp_name" "$file"
             fi
         fi
     fi
 done
 
-# Calculate MD5 checksum of the executable
-md5=$(md5sum "./$base_name" | awk '{print $1}')
-
-# Create a tar archive of the files in the temporary directory, excluding 'patchelf'
-tar -cf "./$base_name.tar" --exclude='patchelf' *
-
-# Remove the executable from the temporary directory
-rm "./$base_name"
+# Create a tar archive of the files in the build directory, excluding the helper patchelf
+tar -cf "./bundle.tar" --exclude='__sopacker_patchelf' *
 
 # Get the offset of the tar file in the script
 offset=$(awk '/^__UNPACK_FOLLOWS__/ { print NR + 1; exit 0; }' "$script")
 
-# Extract the tar file from the script and save it to a new file
-tail -n+$offset "$script" > "$base_name"
+for base_name in "${base_names[@]}"; do
+    # Replace the executable with a wrapper script of the same name
+    rm -f "./$base_name"
 
-# Append the tar file to the new file
-cat  "./$base_name.tar" >> "$base_name"
+    # Extract the wrapper template from this script
+    tail -n+$offset "$script" > "$base_name"
 
-# Insert MD5 checksum, executable name, and temporary directory path into the new file
-sed -i "2a\md5sum=$md5" "$base_name"
-sed -i "2a\execname=$base_name" "$base_name"
-sed -i "2a\interpname=$lib_interp_name" "$base_name"
-sed -i "2a\tempdir=$tempdir" "$base_name"
+    # Append the shared tar payload
+    cat "./bundle.tar" >> "$base_name"
+
+    # Inject runtime parameters (shared tempdir/bundle id, per-exec execname)
+    sed -i "2a\bundle_id=$bundle_id" "$base_name"
+    sed -i "2a\interpname=$lib_interp_name" "$base_name"
+    sed -i "2a\execname=$base_name" "$base_name"
+    sed -i "2a\tempdir=$runtime_tempdir" "$base_name"
+
+    chmod +x "$base_name"
+done
 
 # Change back to the original directory
 popd >/dev/null
 
-# Copy the new file to the output directory and make it executable
-cp -f "$tempdir/$base_name" "$output_dir"
-chmod +x "$output_dir/$base_name"
+# Copy wrappers to output
+for base_name in "${base_names[@]}"; do
+    cp -f "$tempdir/$base_name" "$output_dir"
+    chmod +x "$output_dir/$base_name"
+done
 
 # Remove the temporary directory
 rm -rf "$tempdir"
@@ -180,7 +235,7 @@ exit 0
 __UNPACK_FOLLOWS__
 #!/bin/bash
 
-# Insert md5sum, execname, interpname and tempdir here
+# Insert bundle_id, execname, interpname and tempdir here
 
 # BSD 3-Clause License
 
@@ -215,32 +270,35 @@ __UNPACK_FOLLOWS__
 #
 # Author: Yuchen <yuchen19971216@gmail.com>
 
-# Function to find a matching directory based on MD5 checksum and filename
-find_matching_dir() {
-    local expected_md5="$1"
-    local filename="$2"
-    local dir="$3"
+is_bundle_ready() {
+    local dir="$1"
+    local expected_bundle_id="$2"
+    local filename="$3"
 
-    if [ -f "$dir/$filename" ]; then
-        local actual_md5=$(md5sum "$dir/$filename" | cut -d' ' -f1)
-        if [ "$actual_md5" = "$expected_md5" ]; then
+    if [ -f "$dir/.sopacker_bundle_id" ] && [ -f "$dir/$filename" ]; then
+        local actual_bundle_id
+        actual_bundle_id=$(cat "$dir/.sopacker_bundle_id" 2>/dev/null || true)
+        if [ "$actual_bundle_id" = "$expected_bundle_id" ]; then
             return 0
-        else
-            rm -rf $dir
-            return 1
         fi
     fi
 
     return 1
 }
 
-find_matching_dir $md5sum $execname $tempdir
+mkdir -p "$tempdir"
 
-# If a matching directory is not found, extract the tar file and create a new directory
-if [ $? -ne 0 ]; then
-    mkdir -p $tempdir
+# Lock to avoid concurrent partial extraction
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$tempdir/.sopacker_lock"
+    flock -x 9
+fi
+
+if ! is_bundle_ready "$tempdir" "$bundle_id" "$execname"; then
+    rm -rf "$tempdir"/*
     offset=$(awk '/^__TARFILE_FOLLOWS__/ { print NR + 1; exit 0; }' "$0")
-    tail -n+$offset "$0" | tar -xf - -C $tempdir >/dev/null 2>&1
+    tail -n+$offset "$0" | tar -xf - -C "$tempdir" >/dev/null 2>&1
+    echo "$bundle_id" > "$tempdir/.sopacker_bundle_id"
 fi
 
 # Execute the program with the provided arguments.
