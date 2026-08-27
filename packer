@@ -304,8 +304,8 @@ fi
 # Execute the program with the provided arguments.
 # NOTE: `ldd` on the extracted executable is misleading because the system `ldd` script
 # uses the host loader to trace dependencies. We explicitly invoke the bundled loader.
-"$tempdir/$interpname" --library-path "$tempdir" "$tempdir/$execname" "$@"
-
-exit 0
+exec "$tempdir/$interpname" \
+    --library-path "$tempdir" \
+    "$tempdir/$execname" "$@"
 
 __TARFILE_FOLLOWS__
