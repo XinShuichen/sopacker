@@ -289,9 +289,11 @@ is_bundle_ready() {
 mkdir -p "$tempdir"
 
 # Lock to avoid concurrent partial extraction
+lock_fd_open=0
 if command -v flock >/dev/null 2>&1; then
     exec 9>"$tempdir/.sopacker_lock"
     flock -x 9
+    lock_fd_open=1
 fi
 
 if ! is_bundle_ready "$tempdir" "$bundle_id" "$execname"; then
@@ -299,6 +301,11 @@ if ! is_bundle_ready "$tempdir" "$bundle_id" "$execname"; then
     offset=$(awk '/^__TARFILE_FOLLOWS__/ { print NR + 1; exit 0; }' "$0")
     tail -n+$offset "$0" | tar -xf - -C "$tempdir" >/dev/null 2>&1
     echo "$bundle_id" > "$tempdir/.sopacker_bundle_id"
+fi
+
+if [ "$lock_fd_open" -eq 1 ]; then
+    flock -u 9
+    exec 9>&-
 fi
 
 # Execute the program with the provided arguments.
